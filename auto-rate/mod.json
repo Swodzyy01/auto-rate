@@ -1,0 +1,49 @@
+{
+	"geode": "4.6.0",
+	"gd": {
+		"win": "2.2074",
+		"android": "2.2074",
+		"mac": "2.2074",
+		"ios": "2.2074"
+	},
+	"version": "v1.0.0",
+	"id": "yourname.auto-rate",
+	"name": "Auto Rate",
+	"developer": "yourname",
+	"description": "Analyses your whole level and adds themed decoration: glow edges, crowns, hazard glow, city skyline, background shapes, color and pulse triggers.",
+	"tags": ["editor", "enhancement"],
+	"settings": {
+		"style": {
+			"type": "string",
+			"name": "Style",
+			"description": "Decoration theme.",
+			"default": "Hell",
+			"one-of": ["Hell", "Heaven", "Gold", "Neon", "Blue"]
+		},
+		"quality": {
+			"type": "string",
+			"name": "Quality",
+			"description": "Fast = light, Ultra = dense decoration (more objects, takes longer).",
+			"default": "Normal",
+			"one-of": ["Fast", "Normal", "Ultra"]
+		},
+		"background": {
+			"type": "bool",
+			"name": "Background",
+			"description": "Add background color, skyline and background shapes.",
+			"default": true
+		},
+		"crown": {
+			"type": "bool",
+			"name": "Crown spikes",
+			"description": "Add decorative spikes on top of platforms (non-solid, behind the player).",
+			"default": true
+		},
+		"pulses": {
+			"type": "bool",
+			"name": "Pulse effects",
+			"description": "Add pulse triggers along the level.",
+			"default": true
+		}
+	}
+}
