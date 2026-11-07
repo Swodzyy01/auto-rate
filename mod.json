@@ -11,21 +11,34 @@
 	"name": "Auto Rate",
 	"developer": "yourname",
 	"description": "Analyses your whole level and adds themed decoration: glow edges, crowns, hazard glow, city skyline, background shapes, color and pulse triggers.",
-	"tags": ["editor", "enhancement"],
+	"tags": [
+		"editor",
+		"enhancement"
+	],
 	"settings": {
 		"style": {
 			"type": "string",
 			"name": "Style",
 			"description": "Decoration theme.",
 			"default": "Hell",
-			"one-of": ["Hell", "Heaven", "Gold", "Neon", "Blue"]
+			"one-of": [
+				"Hell",
+				"Heaven",
+				"Gold",
+				"Neon",
+				"Blue"
+			]
 		},
 		"quality": {
 			"type": "string",
 			"name": "Quality",
 			"description": "Fast = light, Ultra = dense decoration (more objects, takes longer).",
 			"default": "Normal",
-			"one-of": ["Fast", "Normal", "Ultra"]
+			"one-of": [
+				"Fast",
+				"Normal",
+				"Ultra"
+			]
 		},
 		"background": {
 			"type": "bool",
@@ -44,6 +57,28 @@
 			"name": "Pulse effects",
 			"description": "Add pulse triggers along the level.",
 			"default": true
+		},
+		"replace-previous": {
+			"type": "bool",
+			"name": "Replace previous run",
+			"description": "Delete the decoration from an earlier Auto Rate run before adding the new one.",
+			"default": true
+		},
+		"y-offset": {
+			"type": "float",
+			"name": "Y offset",
+			"description": "Shift everything Auto Rate adds up (+) or down (-), in units. 30 = one block.",
+			"default": 0,
+			"min": -120,
+			"max": 120
+		},
+		"analysis-time": {
+			"type": "int",
+			"name": "Analysis time (seconds)",
+			"description": "How long the analysis runs before the decoration is placed. 0 = instant.",
+			"default": 60,
+			"min": 0,
+			"max": 300
 		}
 	}
 }
