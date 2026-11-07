@@ -24,9 +24,9 @@
 			"one-of": [
 				"Hell",
 				"Heaven",
-				"Gold",
-				"Neon",
-				"Blue"
+				"Green",
+				"Yellow",
+				"Aqua"
 			]
 		},
 		"quality": {
@@ -40,11 +40,16 @@
 				"Ultra"
 			]
 		},
-		"background": {
-			"type": "bool",
+		"bg-mode": {
+			"type": "string",
 			"name": "Background",
-			"description": "Add background color, skyline and background shapes.",
-			"default": true
+			"description": "Off = leave the level's background alone. Colors = set background/ground colors. Full = colors + a few shapes in empty areas.",
+			"default": "Colors",
+			"one-of": [
+				"Off",
+				"Colors",
+				"Full"
+			]
 		},
 		"crown": {
 			"type": "bool",
