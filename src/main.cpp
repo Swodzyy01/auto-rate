@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <locale>
@@ -177,13 +178,13 @@ bool isOurs(std::map<int, std::string> const& kv) {
 // ------------------------------------------------------------------ runner
 class AutoRateRunner : public CCNode {
 public:
-    static void start(LevelEditorLayer* lel, bool removeOnly = false) {
+    static void start(LevelEditorLayer* lel, bool removeOnly = false, bool wholeLevel = false) {
         if (s_busy) {
             Notification::create("Auto Rate is already running", NotificationIcon::Warning)->show();
             return;
         }
         auto r = new AutoRateRunner();
-        if (r->init(lel, removeOnly)) {
+        if (r->init(lel, removeOnly, wholeLevel)) {
             s_busy = true;
             r->autorelease();
             lel->addChild(r);
@@ -248,7 +249,7 @@ private:
 
     ~AutoRateRunner() override { s_busy = false; }
 
-    bool init(LevelEditorLayer* lel, bool removeOnly) {
+    bool init(LevelEditorLayer* lel, bool removeOnly, bool wholeLevel) {
         if (!CCNode::init()) return false;
         m_lel = lel;
         m_removeOnly = removeOnly;
@@ -269,7 +270,7 @@ private:
         m_start = std::chrono::steady_clock::now();
 
         // Objects selected in the editor: decorate only those.
-        if (!removeOnly && lel->m_editorUI) {
+        if (!removeOnly && !wholeLevel && lel->m_editorUI) {
             if (auto arr = lel->m_editorUI->getSelectedObjects()) {
                 for (auto* o : CCArrayExt<GameObject*>(arr)) m_sel.insert(o);
             }
@@ -924,88 +925,210 @@ private:
     }
 };
 
-}  // namespace
 
-// ------------------------------------------------------------------- hook
-class $modify(AutoRatePauseLayer, EditorPauseLayer) {
-    bool init(LevelEditorLayer* lel) {
-        if (!EditorPauseLayer::init(lel)) return false;
+// ---------------------------------------------------------------- the menu
+int const TIME_PRESETS[] = {0, 10, 30, 60, 120, 300};
 
-        auto mod = Mod::get();
+int stepTimePreset(int cur, int dir) {
+    int n = (int)(sizeof(TIME_PRESETS) / sizeof(int));
+    int idx = 0, best = 1 << 30;
+    for (int i = 0; i < n; ++i) {
+        int d = std::abs(TIME_PRESETS[i] - cur);
+        if (d < best) {
+            best = d;
+            idx = i;
+        }
+    }
+    return TIME_PRESETS[dir > 0 ? (idx + 1) % n : (idx + n - 1) % n];
+}
+
+int selectedCount(LevelEditorLayer* lel) {
+    if (lel && lel->m_editorUI) {
+        if (auto arr = lel->m_editorUI->getSelectedObjects()) return (int)arr->count();
+    }
+    return 0;
+}
+
+// The panel that opens from the pause menu button.
+class AutoRateMenu : public FLAlertLayer {
+public:
+    static AutoRateMenu* create(LevelEditorLayer* lel, EditorPauseLayer* pause) {
+        auto ret = new AutoRateMenu();
+        if (ret->setup(lel, pause)) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+
+private:
+    LevelEditorLayer* m_lel = nullptr;
+    Ref<EditorPauseLayer> m_pause;
+    int m_selected = 0;
+    bool m_whole = false;
+    float m_cx = 0.f, m_cy = 0.f;
+    CCLabelBMFont* m_styleLbl = nullptr;
+    CCLabelBMFont* m_qualLbl = nullptr;
+    CCLabelBMFont* m_bgLbl = nullptr;
+    CCLabelBMFont* m_targetLbl = nullptr;
+    CCLabelBMFont* m_timeLbl = nullptr;
+    CCNode* m_swatches = nullptr;
+    CCMenuItemSpriteExtra* m_targetPrev = nullptr;
+    CCMenuItemSpriteExtra* m_targetNext = nullptr;
+
+    bool setup(LevelEditorLayer* lel, EditorPauseLayer* pause) {
+        if (!FLAlertLayer::init(100)) return false;
+        m_lel = lel;
+        m_pause = pause;
+        m_selected = selectedCount(lel);
+
         auto win = CCDirector::get()->getWinSize();
-        float cx = win.width - 95.f;
+        m_cx = win.width / 2.f;
+        m_cy = win.height / 2.f;
+        float W = 340.f, H = 270.f;
 
-        auto menu = CCMenu::create();
-        menu->setID("auto-rate-menu"_spr);
-        menu->setPosition({cx, 30.f});
+        m_mainLayer = CCLayer::create();
+        this->addChild(m_mainLayer);
 
-        auto bigBtn = [&](char const* label, SEL_MenuHandler cb, float y, std::string const& id) {
-            auto btn = CCMenuItemSpriteExtra::create(ButtonSprite::create(label), this, cb);
-            btn->setID(id);
-            btn->setPosition({0.f, y});
-            menu->addChild(btn);
-        };
-        auto arrow = [&](bool right, SEL_MenuHandler cb, float y, std::string const& id) {
+        auto bg = CCScale9Sprite::create("GJ_square01.png", {0.f, 0.f, 80.f, 80.f});
+        bg->setContentSize({W, H});
+        bg->setPosition({m_cx, m_cy});
+        m_mainLayer->addChild(bg);
+
+        auto title = CCLabelBMFont::create("Auto Rate", "goldFont.fnt");
+        title->setScale(0.8f);
+        title->setPosition({m_cx, m_cy + H / 2.f - 22.f});
+        m_mainLayer->addChild(title, 5);
+
+        m_buttonMenu = CCMenu::create();
+        m_buttonMenu->setPosition({m_cx, m_cy});
+        m_buttonMenu->setTouchPriority(-502);
+        m_mainLayer->addChild(m_buttonMenu, 10);
+
+        auto arrow = [&](bool right, float y, SEL_MenuHandler cb) {
             auto spr = CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png");
             spr->setScale(0.8f);
             spr->setFlipX(right);
             auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
-            btn->setID(id);
-            btn->setPosition({right ? 80.f : -80.f, y});
-            menu->addChild(btn);
+            btn->setPosition({right ? 130.f : -130.f, y});
+            m_buttonMenu->addChild(btn);
+            return btn;
         };
-        auto valueLabel = [&](std::string const& text, float y, std::string const& id) {
-            auto lbl = CCLabelBMFont::create(text.c_str(), "bigFont.fnt");
-            lbl->setScale(0.45f);
-            lbl->setID(id);
-            lbl->setPosition({cx, 30.f + y});
-            this->addChild(lbl);
+        auto label = [&](float y) {
+            auto lbl = CCLabelBMFont::create("", "bigFont.fnt");
+            lbl->setScale(0.55f);
+            lbl->setPosition({m_cx, m_cy + y});
+            m_mainLayer->addChild(lbl, 5);
+            return lbl;
         };
 
-        bigBtn("Auto Rate", menu_selector(AutoRatePauseLayer::onAutoRate), 0.f, "auto-rate-button"_spr);
-        bigBtn("Remove", menu_selector(AutoRatePauseLayer::onRemove), 34.f, "auto-rate-remove"_spr);
+        // rows: label in the middle, arrows left and right
+        m_styleLbl = label(78.f);
+        arrow(false, 78.f, menu_selector(AutoRateMenu::onStylePrev));
+        arrow(true, 78.f, menu_selector(AutoRateMenu::onStyleNext));
 
-        arrow(false, menu_selector(AutoRatePauseLayer::onBgPrev), 68.f, "auto-rate-bg-prev"_spr);
-        arrow(true, menu_selector(AutoRatePauseLayer::onBgNext), 68.f, "auto-rate-bg-next"_spr);
-        valueLabel("Background: " + mod->getSettingValue<std::string>("bg-mode"), 68.f, "auto-rate-bg-label"_spr);
+        m_qualLbl = label(36.f);
+        arrow(false, 36.f, menu_selector(AutoRateMenu::onQualityPrev));
+        arrow(true, 36.f, menu_selector(AutoRateMenu::onQualityNext));
 
-        arrow(false, menu_selector(AutoRatePauseLayer::onQualityPrev), 102.f, "auto-rate-quality-prev"_spr);
-        arrow(true, menu_selector(AutoRatePauseLayer::onQualityNext), 102.f, "auto-rate-quality-next"_spr);
-        valueLabel("Quality: " + mod->getSettingValue<std::string>("quality"), 102.f, "auto-rate-quality-label"_spr);
+        m_bgLbl = label(6.f);
+        arrow(false, 6.f, menu_selector(AutoRateMenu::onBgPrev));
+        arrow(true, 6.f, menu_selector(AutoRateMenu::onBgNext));
 
-        arrow(false, menu_selector(AutoRatePauseLayer::onStylePrev), 136.f, "auto-rate-style-prev"_spr);
-        arrow(true, menu_selector(AutoRatePauseLayer::onStyleNext), 136.f, "auto-rate-style-next"_spr);
-        valueLabel("Style: " + mod->getSettingValue<std::string>("style"), 136.f, "auto-rate-style-label"_spr);
+        m_targetLbl = label(-24.f);
+        m_targetPrev = arrow(false, -24.f, menu_selector(AutoRateMenu::onTargetToggle));
+        m_targetNext = arrow(true, -24.f, menu_selector(AutoRateMenu::onTargetToggle));
 
-        this->addChild(menu);
+        m_timeLbl = label(-54.f);
+        arrow(false, -54.f, menu_selector(AutoRateMenu::onTimePrev));
+        arrow(true, -54.f, menu_selector(AutoRateMenu::onTimeNext));
+
+        auto startBtn = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("Start"), this, menu_selector(AutoRateMenu::onStart));
+        startBtn->setPosition({-60.f, -98.f});
+        m_buttonMenu->addChild(startBtn);
+
+        auto removeBtn = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("Remove"), this, menu_selector(AutoRateMenu::onRemove));
+        removeBtn->setPosition({70.f, -98.f});
+        m_buttonMenu->addChild(removeBtn);
+
+        auto closeBtn = CCMenuItemSpriteExtra::create(
+            CCSprite::createWithSpriteFrameName("GJ_closeBtn_001.png"), this, menu_selector(AutoRateMenu::onClose));
+        closeBtn->setPosition({-W / 2.f + 8.f, H / 2.f - 8.f});
+        m_buttonMenu->addChild(closeBtn);
+
+        auto info = CCLabelBMFont::create(
+            "Start replaces the previous Auto Rate decoration. Remove restores the plain level.", "chatFont.fnt");
+        info->setScale(0.45f);
+        info->setOpacity(160);
+        info->setPosition({m_cx, m_cy - H / 2.f + 14.f});
+        m_mainLayer->addChild(info, 5);
+
+        this->refresh();
+        this->setTouchEnabled(true);
+        this->setKeypadEnabled(true);
         return true;
     }
 
-    void setLabel(std::string const& id, std::string const& text) {
-        if (auto lbl = typeinfo_cast<CCLabelBMFont*>(this->getChildByID(id))) {
-            lbl->setString(text.c_str());
+    void refresh() {
+        auto mod = Mod::get();
+        auto const& st = findStyle(mod->getSettingValue<std::string>("style"));
+
+        m_styleLbl->setString(fmt::format("Style: {}", st.name).c_str());
+        m_qualLbl->setString(fmt::format("Quality: {}", mod->getSettingValue<std::string>("quality")).c_str());
+        m_bgLbl->setString(fmt::format("Background: {}", mod->getSettingValue<std::string>("bg-mode")).c_str());
+
+        int64_t secs = mod->getSettingValue<int64_t>("analysis-time");
+        std::string t = secs <= 0 ? std::string("Analysis: instant") : fmt::format("Analysis: {} s", secs);
+        m_timeLbl->setString(t.c_str());
+
+        std::string target;
+        if (m_selected > 0 && !m_whole) {
+            target = fmt::format("Target: {} selected", m_selected);
+        } else {
+            target = "Target: whole level";
         }
+        m_targetLbl->setString(target.c_str());
+        m_targetPrev->setVisible(m_selected > 0);
+        m_targetNext->setVisible(m_selected > 0);
+
+        // palette preview: background, dark, mid, bright, glow
+        if (m_swatches) m_swatches->removeFromParent();
+        m_swatches = CCNode::create();
+        ccColor3B cols[5] = {st.bg, st.dark, st.mid, st.bright, st.glow};
+        for (int i = 0; i < 5; ++i) {
+            auto sq = CCLayerColor::create(ccc4(cols[i].r, cols[i].g, cols[i].b, 255), 18.f, 12.f);
+            sq->setPosition({m_cx - 55.f + i * 22.f, m_cy + 56.f});
+            m_swatches->addChild(sq);
+        }
+        m_mainLayer->addChild(m_swatches, 5);
     }
 
     void stepStyle(int dir) {
         auto mod = Mod::get();
-        auto next = stepName(STYLE_NAMES, mod->getSettingValue<std::string>("style"), dir);
-        mod->setSettingValue<std::string>("style", next);
-        this->setLabel("auto-rate-style-label"_spr, "Style: " + next);
+        std::string cur = findStyle(mod->getSettingValue<std::string>("style")).name;
+        mod->setSettingValue<std::string>("style", stepName(STYLE_NAMES, cur, dir));
+        this->refresh();
     }
-
     void stepQuality(int dir) {
         auto mod = Mod::get();
-        auto next = stepName(QUALITY_NAMES, mod->getSettingValue<std::string>("quality"), dir);
-        mod->setSettingValue<std::string>("quality", next);
-        this->setLabel("auto-rate-quality-label"_spr, "Quality: " + next);
+        mod->setSettingValue<std::string>(
+            "quality", stepName(QUALITY_NAMES, mod->getSettingValue<std::string>("quality"), dir));
+        this->refresh();
     }
-
     void stepBg(int dir) {
         auto mod = Mod::get();
-        auto next = stepName(BG_NAMES, mod->getSettingValue<std::string>("bg-mode"), dir);
-        mod->setSettingValue<std::string>("bg-mode", next);
-        this->setLabel("auto-rate-bg-label"_spr, "Background: " + next);
+        mod->setSettingValue<std::string>(
+            "bg-mode", stepName(BG_NAMES, mod->getSettingValue<std::string>("bg-mode"), dir));
+        this->refresh();
+    }
+    void stepTime(int dir) {
+        auto mod = Mod::get();
+        int cur = (int)mod->getSettingValue<int64_t>("analysis-time");
+        mod->setSettingValue<int64_t>("analysis-time", (int64_t)stepTimePreset(cur, dir));
+        this->refresh();
     }
 
     void onStylePrev(CCObject*) { this->stepStyle(-1); }
@@ -1014,47 +1137,68 @@ class $modify(AutoRatePauseLayer, EditorPauseLayer) {
     void onQualityNext(CCObject*) { this->stepQuality(1); }
     void onBgPrev(CCObject*) { this->stepBg(-1); }
     void onBgNext(CCObject*) { this->stepBg(1); }
+    void onTimePrev(CCObject*) { this->stepTime(-1); }
+    void onTimeNext(CCObject*) { this->stepTime(1); }
+    void onTargetToggle(CCObject*) {
+        m_whole = !m_whole;
+        this->refresh();
+    }
 
-    void onAutoRate(CCObject*) {
-        auto mod = Mod::get();
-        auto style = mod->getSettingValue<std::string>("style");
-        auto quality = mod->getSettingValue<std::string>("quality");
-        auto secs = mod->getSettingValue<int64_t>("analysis-time");
-        auto lel = m_editorLayer;
-
-        int selected = 0;
-        if (lel->m_editorUI) {
-            if (auto arr = lel->m_editorUI->getSelectedObjects()) selected = (int)arr->count();
-        }
-        std::string target = selected > 0
-            ? fmt::format("Only your <cy>{}</c> selected objects will be decorated.", selected)
-            : std::string("The <cy>whole level</c> will be decorated. (Select objects first to decorate only those.)");
-
-        createQuickPopup(
-            "Auto Rate",
-            fmt::format(
-                "Style: <cy>{}</c>   Quality: <cy>{}</c>\n{}\n"
-                "The analysis takes about <cy>{}</c> seconds.\n"
-                "Earlier Auto Rate decoration is replaced automatically.",
-                style, quality, target, secs),
-            "Cancel", "Start",
-            [this, lel](FLAlertLayer*, bool ok) {
-                if (!ok) return;
-                this->onResume(nullptr);
-                AutoRateRunner::start(lel);
-            });
+    void onStart(CCObject*) {
+        auto lel = m_lel;
+        bool whole = m_whole;
+        Ref<EditorPauseLayer> pause = m_pause;
+        this->onClose(nullptr);
+        if (pause) pause->onResume(nullptr);
+        AutoRateRunner::start(lel, false, whole);
     }
 
     void onRemove(CCObject*) {
-        auto lel = m_editorLayer;
+        Ref<AutoRateMenu> self = this;
         createQuickPopup(
             "Auto Rate",
             "Delete everything Auto Rate added to this level?\nYour own objects are not touched.",
             "Cancel", "Delete",
-            [this, lel](FLAlertLayer*, bool ok) {
+            [self](FLAlertLayer*, bool ok) {
                 if (!ok) return;
-                this->onResume(nullptr);
+                auto lel = self->m_lel;
+                Ref<EditorPauseLayer> pause = self->m_pause;
+                self->onClose(nullptr);
+                if (pause) pause->onResume(nullptr);
                 AutoRateRunner::start(lel, true);
             });
+    }
+
+    void onClose(CCObject*) {
+        this->setKeypadEnabled(false);
+        this->setTouchEnabled(false);
+        this->removeFromParentAndCleanup(true);
+    }
+
+    void keyBackClicked() override { this->onClose(nullptr); }
+};
+
+}  // namespace
+
+// ------------------------------------------------------------------- hook
+class $modify(AutoRatePauseLayer, EditorPauseLayer) {
+    bool init(LevelEditorLayer* lel) {
+        if (!EditorPauseLayer::init(lel)) return false;
+
+        auto win = CCDirector::get()->getWinSize();
+        auto btn = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("Auto Rate"), this, menu_selector(AutoRatePauseLayer::onAutoRate));
+        btn->setID("auto-rate-button"_spr);
+
+        auto menu = CCMenu::create();
+        menu->setID("auto-rate-menu"_spr);
+        menu->setPosition({win.width - 70.f, 30.f});
+        menu->addChild(btn);
+        this->addChild(menu);
+        return true;
+    }
+
+    void onAutoRate(CCObject*) {
+        if (auto menu = AutoRateMenu::create(m_editorLayer, this)) menu->show();
     }
 };
