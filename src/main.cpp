@@ -27,6 +27,23 @@ namespace {
 
 using Cell = std::pair<int, int>;  // (column, row) in 30-unit grid cells
 
+// Every object Auto Rate adds is tagged with BOTH of these groups, so a later
+// run (or the Remove button) can find and delete only its own output.
+constexpr int GROUP_A = 9998;
+constexpr int GROUP_B = 9999;
+
+char const* const STYLE_NAMES[] = {"Hell", "Heaven", "Gold", "Neon", "Blue"};
+char const* const QUALITY_NAMES[] = {"Fast", "Normal", "Ultra"};
+
+template <size_t N>
+std::string stepName(char const* const (&arr)[N], std::string const& cur, int dir) {
+    size_t idx = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (cur == arr[i]) idx = i;
+    }
+    return arr[dir > 0 ? (idx + 1) % N : (idx + N - 1) % N];
+}
+
 // ------------------------------------------------------------------ styles
 struct StyleDef {
     char const* name;
@@ -77,7 +94,7 @@ std::string toStr(Obj const& o) {
     if (o.sx != 1.f) s << ",128," << o.sx;
     if (o.sy != 1.f) s << ",129," << o.sy;
     if (o.noTouch) s << ",121,1";
-    s << ';';
+    s << ",57," << GROUP_A << '.' << GROUP_B << ';';
     return s.str();
 }
 
@@ -89,7 +106,7 @@ std::string colorTrig(float x, float y, int channel, ccColor3B c, float opacity,
       << ",7," << (int)c.r << ",8," << (int)c.g << ",9," << (int)c.b
       << ",10,0,35," << opacity << ",23," << channel;
     if (blend) s << ",17,1";
-    s << ';';
+    s << ",57," << GROUP_A << '.' << GROUP_B << ';';
     return s.str();
 }
 
@@ -99,7 +116,8 @@ std::string pulseTrig(float x, float y, int channel, ccColor3B c) {
     s << std::fixed << std::setprecision(2);
     s << "1,1006,2," << x << ",3," << y
       << ",7," << (int)c.r << ",8," << (int)c.g << ",9," << (int)c.b
-      << ",45,0.00,46,0.05,47,0.30,48,0,52,0,51," << channel << ';';
+      << ",45,0.00,46,0.05,47,0.30,48,0,52,0,51," << channel
+      << ",57," << GROUP_A << '.' << GROUP_B << ';';
     return s.str();
 }
 
@@ -119,12 +137,35 @@ std::map<int, std::string> parseKV(std::string const& str) {
     return out;
 }
 
+// True if the object's group list (key 57) contains both of our marker groups.
+bool isOurs(std::map<int, std::string> const& kv) {
+    auto it = kv.find(57);
+    if (it == kv.end()) return false;
+    auto const& str = it->second;
+    bool a = false, b = false;
+    size_t start = 0;
+    while (start <= str.size()) {
+        size_t e = str.find('.', start);
+        if (e == std::string::npos) e = str.size();
+        int g = std::atoi(str.substr(start, e - start).c_str());
+        if (g == GROUP_A) a = true;
+        if (g == GROUP_B) b = true;
+        start = e + 1;
+    }
+    return a && b;
+}
+
 // ------------------------------------------------------------------ runner
 class AutoRateRunner : public CCNode {
 public:
-    static void start(LevelEditorLayer* lel) {
+    static void start(LevelEditorLayer* lel, bool removeOnly = false) {
+        if (s_busy) {
+            Notification::create("Auto Rate is already running", NotificationIcon::Warning)->show();
+            return;
+        }
         auto r = new AutoRateRunner();
-        if (r->init(lel)) {
+        if (r->init(lel, removeOnly)) {
+            s_busy = true;
             r->autorelease();
             lel->addChild(r);
         } else {
@@ -133,7 +174,8 @@ public:
     }
 
 private:
-    enum class Phase { Scan, Faces, Skyline, Hazards, BgShapes, Triggers, Place, Finish };
+    static inline bool s_busy = false;
+    enum class Phase { Scan, Clean, Faces, Skyline, Hazards, BgShapes, Triggers, Wait, Place, Finish };
     struct Hz { int id; float x, y, rot; bool fx, fy; };
     struct Run { bool active = false; int cy = 0, start = 0, last = 0; };
 
@@ -143,7 +185,11 @@ private:
     int m_bgStep = 9;
     float m_pulseStep = 240.f;
     bool m_bg = true, m_crown = true, m_pulses = true;
+    bool m_removeOnly = false, m_replace = true;
+    float m_yOff = 0.f;
     std::string m_qName;
+    float m_minSeconds = 0.f;  // analysis pacing: results are placed after this many seconds
+    std::chrono::steady_clock::time_point m_start = std::chrono::steady_clock::now();
 
     Ref<Notification> m_notif;
     Phase m_phase = Phase::Scan;
@@ -155,6 +201,8 @@ private:
     std::set<Cell> m_solid, m_occ;
     std::vector<Cell> m_rows;  // (row, column) sorted
     std::vector<Hz> m_hazards;
+    std::vector<Ref<GameObject>> m_old;  // objects from an earlier Auto Rate run
+    int m_nRemoved = 0;
     std::map<int, int> m_decoChunk;
     std::set<int> m_usedColors;
     bool m_hasBounds = false;
@@ -170,9 +218,12 @@ private:
     std::vector<std::string> m_out;
     size_t m_placed = 0;
 
-    bool init(LevelEditorLayer* lel) {
+    ~AutoRateRunner() override { s_busy = false; }
+
+    bool init(LevelEditorLayer* lel, bool removeOnly) {
         if (!CCNode::init()) return false;
         m_lel = lel;
+        m_removeOnly = removeOnly;
         auto mod = Mod::get();
         m_style = &findStyle(mod->getSettingValue<std::string>("style"));
         m_qName = mod->getSettingValue<std::string>("quality");
@@ -182,6 +233,10 @@ private:
         m_bg = mod->getSettingValue<bool>("background");
         m_crown = mod->getSettingValue<bool>("crown");
         m_pulses = mod->getSettingValue<bool>("pulses");
+        m_replace = mod->getSettingValue<bool>("replace-previous") || removeOnly;
+        m_minSeconds = removeOnly ? 0.f : (float)mod->getSettingValue<int64_t>("analysis-time");
+        m_start = std::chrono::steady_clock::now();
+        m_yOff = (float)mod->getSettingValue<double>("y-offset");
 
         for (auto* o : CCArrayExt<GameObject*>(lel->m_objects)) {
             m_objs.emplace_back(o);
@@ -205,7 +260,28 @@ private:
         return 1.f;
     }
     bool roll(float p, int cx) { return rnd() < p * dens(cx); }
-    void add(Obj const& o) { m_out.push_back(toStr(o)); m_nAdded++; }
+    void add(Obj o) {
+        o.y += m_yOff;
+        m_out.push_back(toStr(o));
+        m_nAdded++;
+    }
+
+    float elapsed() {
+        return std::chrono::duration<float>(std::chrono::steady_clock::now() - m_start).count();
+    }
+
+    std::string status(char const* name) {
+        if (m_minSeconds <= 0.f || m_phase >= Phase::Place) {
+            return fmt::format("Auto Rate: {} ({} objects queued)", name, m_out.size());
+        }
+        float left = std::max(0.f, m_minSeconds - elapsed());
+        int pct = (int)std::min(99.f, 100.f * elapsed() / m_minSeconds);
+        return fmt::format("Auto Rate: analysing level... {}%  ({}s left)", pct, (int)std::ceil(left));
+    }
+
+    // The decoration is computed quickly; this holds the result back until the
+    // chosen analysis time (mod setting) has passed. Set the time to 0 for instant.
+    bool doWait() { return elapsed() >= m_minSeconds; }
 
     // ----------------------------------------------------------------- tick
     void tick(float) {
@@ -219,20 +295,22 @@ private:
             char const* name = "";
             switch (m_phase) {
                 case Phase::Scan:     name = "analysing level";   done = doScan(over); break;
+                case Phase::Clean:    name = "removing old deco"; done = doClean(over); break;
                 case Phase::Faces:    name = "edges & crowns";    done = doFaces(over); break;
                 case Phase::Skyline:  name = "background city";   done = doSkyline(over); break;
                 case Phase::Hazards:  name = "hazard glow";       done = doHazards(over); break;
                 case Phase::BgShapes: name = "background shapes"; done = doBgShapes(over); break;
                 case Phase::Triggers: name = "colors & pulses";   done = doTriggers(); break;
+                case Phase::Wait:     name = "analysing level";   done = doWait(); break;
                 case Phase::Place:    name = "placing objects";   done = doPlace(over); break;
                 case Phase::Finish:   finish(); return;
             }
             if (!done) {
-                m_notif->setString(fmt::format("Auto Rate: {} ({} objects queued)", name, m_out.size()));
+                m_notif->setString(status(name));
                 return;
             }
             m_phase = (Phase)((int)m_phase + 1);
-            if (m_abort && m_phase != Phase::Finish) m_phase = Phase::Finish;
+            if ((m_abort || m_removeOnly) && m_phase > Phase::Clean) m_phase = Phase::Finish;
         }
     }
 
@@ -249,6 +327,17 @@ private:
         return true;
     }
 
+    bool doClean(std::function<bool()> const& over) {
+        while (m_i < m_old.size()) {
+            m_lel->removeObject(m_old[m_i++].data(), true);
+            m_nRemoved++;
+            if (over()) return false;
+        }
+        m_old.clear();
+        m_i = 0;
+        return true;
+    }
+
     void scanOne(GameObject* o) {
         auto type = o->m_objectType;
         auto p = o->getPosition();
@@ -257,6 +346,10 @@ private:
 
         // Parse the save string: it lists every color channel the object uses.
         auto kv = parseKV(std::string(o->getSaveString(m_lel).c_str()));
+        if (m_replace && isOurs(kv)) {
+            m_old.emplace_back(o);  // our own earlier output: delete, don't analyse
+            return;
+        }
         for (int k : {21, 22, 23, 50, 51}) {
             auto it = kv.find(k);
             if (it != kv.end()) m_usedColors.insert(std::atoi(it->second.c_str()));
@@ -304,7 +397,8 @@ private:
             m_abort = true;
             return;
         }
-        m_baseCy = std::max(0, m_minCy);
+        // GD's ground top is at y=90 (row 3). Never start the background higher than the ground.
+        m_baseCy = std::min(std::max(0, m_minCy), 3);
         for (auto& c : m_solid) m_rows.push_back({c.second, c.first});
         std::sort(m_rows.begin(), m_rows.end());
 
@@ -605,17 +699,19 @@ private:
         m_notif->hide();
 
         std::string report;
-        if (m_abort) {
+        if (m_removeOnly) {
+            report = fmt::format("Removed <cg>{}</c> Auto Rate objects.", m_nRemoved);
+        } else if (m_abort) {
             report = "Nothing to decorate: no blocks, slopes or hazards were found in this level.";
         } else {
             report = fmt::format(
                 "Style: <cy>{}</c>  |  Quality: <cy>{}</c>\n"
                 "Analysed: {} solid blocks, {} hazards, {} existing decoration objects\n"
                 "Free color channels used: <cg>{}, {}, {}, {}</c>\n"
-                "Added: <cg>{}</c> objects + triggers\n\n"
-                "Undo with Ctrl+Z (it may take a few presses).",
+                "Added: <cg>{}</c> objects + triggers (replaced {} old ones)\n\n"
+                "To remove it: pause menu -> Remove.",
                 m_style->name, m_qName, m_nSolid, m_nHaz, m_nDeco,
-                m_ids[0], m_ids[1], m_ids[2], m_ids[3], m_nAdded);
+                m_ids[0], m_ids[1], m_ids[2], m_ids[3], m_nAdded, m_nRemoved);
         }
         FLAlertLayer::create("Auto Rate", report, "OK")->show();
         this->removeFromParent();
@@ -629,23 +725,85 @@ class $modify(AutoRatePauseLayer, EditorPauseLayer) {
     bool init(LevelEditorLayer* lel) {
         if (!EditorPauseLayer::init(lel)) return false;
 
+        auto mod = Mod::get();
         auto win = CCDirector::get()->getWinSize();
-        auto spr = ButtonSprite::create("Auto Rate");
-        auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(AutoRatePauseLayer::onAutoRate));
-        btn->setID("auto-rate-button"_spr);
+        float cx = win.width - 95.f;
 
         auto menu = CCMenu::create();
         menu->setID("auto-rate-menu"_spr);
-        menu->setPosition({win.width - 70.f, 30.f});
-        menu->addChild(btn);
+        menu->setPosition({cx, 30.f});
+
+        // big buttons
+        auto bigBtn = [&](char const* label, SEL_MenuHandler cb, float y, std::string const& id) {
+            auto btn = CCMenuItemSpriteExtra::create(ButtonSprite::create(label), this, cb);
+            btn->setID(id);
+            btn->setPosition({0.f, y});
+            menu->addChild(btn);
+        };
+        // arrow button (left or right)
+        auto arrow = [&](bool right, SEL_MenuHandler cb, float x, float y, std::string const& id) {
+            auto spr = CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png");
+            spr->setScale(0.8f);
+            spr->setFlipX(right);
+            auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
+            btn->setID(id);
+            btn->setPosition({x, y});
+            menu->addChild(btn);
+        };
+        // value label between the arrows
+        auto valueLabel = [&](std::string const& text, float y, std::string const& id) {
+            auto lbl = CCLabelBMFont::create(text.c_str(), "bigFont.fnt");
+            lbl->setScale(0.45f);
+            lbl->setID(id);
+            lbl->setPosition({cx, 30.f + y});
+            this->addChild(lbl);
+        };
+
+        bigBtn("Auto Rate", menu_selector(AutoRatePauseLayer::onAutoRate), 0.f, "auto-rate-button"_spr);
+        bigBtn("Remove", menu_selector(AutoRatePauseLayer::onRemove), 34.f, "auto-rate-remove"_spr);
+
+        arrow(false, menu_selector(AutoRatePauseLayer::onQualityPrev), -80.f, 68.f, "auto-rate-quality-prev"_spr);
+        arrow(true, menu_selector(AutoRatePauseLayer::onQualityNext), 80.f, 68.f, "auto-rate-quality-next"_spr);
+        valueLabel("Quality: " + mod->getSettingValue<std::string>("quality"), 68.f, "auto-rate-quality-label"_spr);
+
+        arrow(false, menu_selector(AutoRatePauseLayer::onStylePrev), -80.f, 102.f, "auto-rate-style-prev"_spr);
+        arrow(true, menu_selector(AutoRatePauseLayer::onStyleNext), 80.f, 102.f, "auto-rate-style-next"_spr);
+        valueLabel("Style: " + mod->getSettingValue<std::string>("style"), 102.f, "auto-rate-style-label"_spr);
+
         this->addChild(menu);
         return true;
     }
+
+    void setLabel(std::string const& id, std::string const& text) {
+        if (auto lbl = typeinfo_cast<CCLabelBMFont*>(this->getChildByID(id))) {
+            lbl->setString(text.c_str());
+        }
+    }
+
+    void stepStyle(int dir) {
+        auto mod = Mod::get();
+        auto next = stepName(STYLE_NAMES, mod->getSettingValue<std::string>("style"), dir);
+        mod->setSettingValue<std::string>("style", next);
+        this->setLabel("auto-rate-style-label"_spr, "Style: " + next);
+    }
+
+    void stepQuality(int dir) {
+        auto mod = Mod::get();
+        auto next = stepName(QUALITY_NAMES, mod->getSettingValue<std::string>("quality"), dir);
+        mod->setSettingValue<std::string>("quality", next);
+        this->setLabel("auto-rate-quality-label"_spr, "Quality: " + next);
+    }
+
+    void onStylePrev(CCObject*) { this->stepStyle(-1); }
+    void onStyleNext(CCObject*) { this->stepStyle(1); }
+    void onQualityPrev(CCObject*) { this->stepQuality(-1); }
+    void onQualityNext(CCObject*) { this->stepQuality(1); }
 
     void onAutoRate(CCObject*) {
         auto mod = Mod::get();
         auto style = mod->getSettingValue<std::string>("style");
         auto quality = mod->getSettingValue<std::string>("quality");
+        auto secs = mod->getSettingValue<int64_t>("analysis-time");
         auto lel = m_editorLayer;
 
         createQuickPopup(
@@ -653,13 +811,27 @@ class $modify(AutoRatePauseLayer, EditorPauseLayer) {
             fmt::format(
                 "Style: <cy>{}</c>\nQuality: <cy>{}</c>\n\n"
                 "Analyse the whole level and decorate it?\n"
-                "(Change the options in the mod's settings. Undo: Ctrl+Z)",
-                style, quality),
+                "The analysis takes about <cy>{}</c> seconds.\n"
+                "Earlier Auto Rate decoration is replaced automatically.",
+                style, quality, secs),
             "Cancel", "Start",
             [this, lel](FLAlertLayer*, bool ok) {
                 if (!ok) return;
                 this->onResume(nullptr);
                 AutoRateRunner::start(lel);
+            });
+    }
+
+    void onRemove(CCObject*) {
+        auto lel = m_editorLayer;
+        createQuickPopup(
+            "Auto Rate",
+            "Delete everything Auto Rate added to this level?\nYour own objects are not touched.",
+            "Cancel", "Delete",
+            [this, lel](FLAlertLayer*, bool ok) {
+                if (!ok) return;
+                this->onResume(nullptr);
+                AutoRateRunner::start(lel, true);
             });
     }
 };
